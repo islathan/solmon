@@ -24,11 +24,23 @@ pub fn show(lcd: &mut Option<Lcd1602<'_, '_>>, l0: &str, l1: &str) {
     }
 }
 
-/// `Pan  21 Tilt  42` / `   957lx 15.2mW`
-pub fn show_sample(lcd: &mut Option<Lcd1602<'_, '_>>, s: &Sample) {
+/// The two LCD lines for a sample: `AUTO P  21 T  42` / `   957lx 15.2mW`.
+/// `status` (e.g. `-> PARK`, `PIN wrong`) replaces the second line while it is shown.
+pub fn sample_lines(s: &Sample, status: Option<&str>) -> (Buf<16>, Buf<16>) {
     let mut l0: Buf<16> = Buf::new();
     let mut l1: Buf<16> = Buf::new();
-    let _ = write!(l0, "Pan{:>4.0} Tilt{:>4.0}", s.pan.unwrap_or(f32::NAN), s.tilt.unwrap_or(f32::NAN));
+    let mode = s.mode.map_or("", |m| m.label());
+    let _ = write!(
+        l0,
+        "{:<4} P{:>4.0} T{:>4.0}",
+        mode,
+        s.pan.unwrap_or(f32::NAN),
+        s.tilt.unwrap_or(f32::NAN)
+    );
+    if let Some(st) = status {
+        let _ = l1.write_str(st);
+        return (l0, l1);
+    }
     match s.lux {
         Some(lux) => {
             let _ = write!(l1, "{:>6.0}lx", lux);
@@ -40,6 +52,11 @@ pub fn show_sample(lcd: &mut Option<Lcd1602<'_, '_>>, s: &Sample) {
     if let Some(p) = s.pmw {
         let _ = write!(l1, "{:>5.1}mW", p);
     }
+    (l0, l1)
+}
+
+pub fn show_sample(lcd: &mut Option<Lcd1602<'_, '_>>, s: &Sample, status: Option<&str>) {
+    let (l0, l1) = sample_lines(s, status);
     show(lcd, l0.as_str(), l1.as_str());
 }
 
@@ -84,11 +101,26 @@ impl<const N: usize> Buf<N> {
     pub const fn new() -> Self {
         Self { buf: [0; N], len: 0 }
     }
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
     }
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(self.as_bytes()).unwrap_or("")
+    }
+}
+
+impl<const N: usize> PartialEq for Buf<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
     }
 }
 

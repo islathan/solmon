@@ -8,6 +8,11 @@
 //!   50-55 s  outage                   -> after 3 failed polls: "brainSOL offline", red LED
 //!   55-60 s  sunny again
 //!
+//! With the joystick plugged in (VRX GPIO4, VRY GPIO5, SW GPIO6, see src/hw.rs) the demo also
+//! shows what solmon would send to the tracker (`rate +0.6 -0.2`, `-> HOLD`) and plays the
+//! tracker's part: steering switches to MAN and moves the panel, a press cycles AUTO/HOLD/PARK.
+//! Good for checking the wiring and the stick directions without Wi-Fi.
+//!
 //! Run with: cargo run --release --bin demo     (no environment variables needed)
 
 #![no_std]
@@ -25,7 +30,11 @@ use esp_hal_smartled::{RmtSmartLeds, buffer_size, color_order};
 use libm::sinf;
 use log::{info, warn};
 use smart_leds::RGB8;
-use solmon::display::{BLUE, NUM_LEDS, RED, light_bar, set_leds, show, show_sample, single};
+use core::fmt::Write as _;
+use solmon::control::{Cmd, Joystick};
+use solmon::display::{BLUE, Buf, NUM_LEDS, RED, light_bar, set_leds, show, show_sample, single};
+use solmon::hw::JoystickHw;
+use solmon::sol::Mode;
 use solmon::lcd1602::{self, Lcd1602};
 use solmon::sol::Sample;
 
@@ -62,7 +71,7 @@ fn sample(t: f32) -> Sample {
         lvl *= 1.0 - 0.8 * sinf(core::f32::consts::PI * s / 10.0);
     }
     let lvl = lvl.clamp(0.0, 1.0);
-    Sample { pan: Some(pan), tilt: Some(tilt), lvl: Some(lvl), lux: Some(1100.0 * lvl), pmw: Some(16.0 * lvl) }
+    Sample { mode: Some(Mode::Auto), pan: Some(pan), tilt: Some(tilt), lvl: Some(lvl), lux: Some(1100.0 * lvl), pmw: Some(16.0 * lvl) }
 }
 
 #[esp_rtos::main]
@@ -100,38 +109,102 @@ async fn main(_spawner: Spawner) -> ! {
     )
     .unwrap();
 
+    // Joystick, calibrated at boot (don't touch it while starting).
+    let mut joy_hw = JoystickHw::new(peripherals.ADC1, peripherals.GPIO4, peripherals.GPIO5, peripherals.GPIO6);
+    let mut joystick = joy_hw.calibrate().map(|(cx, cy)| (joy_hw, Joystick::new(cx, cy)));
+
     show(&mut lcd, "brainSOL monitor", "offline DEMO");
     set_leds(&mut leds, &single(BLUE));
     info!("offline demo: 60 s cycle empty -> sunny -> cloud -> outage -> sunny");
     Timer::after(Duration::from_secs(2)).await;
 
+    // The simulated tracker's reaction to the joystick, like brainsolpi: steering -> manual,
+    // press -> the mode solmon asks for. VMAX = brainsolpi's default vmax (config.py:32).
+    const VMAX_DEG_S: f32 = 60.0;
+    let mut mode = Mode::Auto;
+    let (mut man_pan, mut man_tilt) = (0.0f32, 90.0f32);
+    let mut rate = (0.0f32, 0.0f32);
+    let mut status: Buf<16> = Buf::new();
+    let mut status_until = Instant::now();
+    let mut next_draw = Instant::now();
+
     let start = Instant::now();
-    let mut fails = 0u32;
     loop {
         let t = start.elapsed().as_millis() as f32 / 1000.0;
-        let p = phase(t);
-        match p {
-            Phase::Empty => {
-                fails = 0;
-                show(&mut lcd, "brainSOL", "no data yet");
-                set_leds(&mut leds, &single(BLUE));
+
+        // --- joystick, every 50 ms ---
+        if let Some((hw, joy)) = joystick.as_mut() {
+            let (x, y, pressed) = hw.read();
+            if let Some(cmd) = joy.update(x, y, pressed, Some(mode), Instant::now().as_millis()) {
+                status.clear();
+                match cmd {
+                    Cmd::Rate { pan, tilt } => {
+                        if mode != Mode::Manual {
+                            // take over from wherever the panel is now
+                            let cur = current(mode, t, man_pan, man_tilt);
+                            (man_pan, man_tilt) = cur;
+                            mode = Mode::Manual;
+                        }
+                        rate = (pan, tilt);
+                        let _ = write!(status, "rate {:+.1} {:+.1}", pan, tilt);
+                    }
+                    Cmd::Mode(m) => {
+                        // HOLD freezes wherever the panel is right now
+                        (man_pan, man_tilt) = current(mode, t, man_pan, man_tilt);
+                        mode = m;
+                        rate = (0.0, 0.0);
+                        let _ = write!(status, "-> {}", m.label());
+                    }
+                }
+                info!("would send {:?}  (x={:.0} y={:.0} mV)", cmd, x, y);
+                status_until = Instant::now() + Duration::from_millis(1500);
+                next_draw = Instant::now();
             }
-            Phase::Sunny | Phase::Cloud => {
-                fails = 0;
-                let s = sample(t);
-                show_sample(&mut lcd, &s);
-                set_leds(&mut leds, &light_bar(s.lvl));
-            }
-            Phase::Down => {
-                // like the real monitor: only show "offline" after 3 failed polls in a row
-                fails += 1;
-                if fails >= 3 {
-                    show(&mut lcd, "brainSOL offline", "DEMO outage");
-                    set_leds(&mut leds, &single(RED));
+        }
+        if mode == Mode::Manual {
+            man_pan = (man_pan + rate.0 * VMAX_DEG_S * 0.05).clamp(-90.0, 90.0);
+            man_tilt = (man_tilt + rate.1 * VMAX_DEG_S * 0.05).clamp(0.0, 180.0);
+        }
+
+        // --- display, every 250 ms ---
+        if Instant::now() >= next_draw {
+            next_draw = Instant::now() + Duration::from_millis(250);
+            let st = (Instant::now() < status_until).then(|| status.as_str());
+            match phase(t) {
+                Phase::Empty => {
+                    show(&mut lcd, "brainSOL", st.unwrap_or("no data yet"));
+                    set_leds(&mut leds, &single(BLUE));
+                }
+                Phase::Sunny | Phase::Cloud => {
+                    let mut s = sample(t);
+                    let (p, tl) = current(mode, t, man_pan, man_tilt);
+                    s.mode = Some(mode);
+                    s.pan = Some(p);
+                    s.tilt = Some(tl);
+                    show_sample(&mut lcd, &s, st);
+                    set_leds(&mut leds, &light_bar(s.lvl));
+                }
+                Phase::Down => {
+                    // like the real monitor: "offline" only after a few seconds without data
+                    if (t % 60.0) - 50.0 >= 3.0 {
+                        show(&mut lcd, "brainSOL offline", "DEMO outage");
+                        set_leds(&mut leds, &single(RED));
+                    }
                 }
             }
         }
-        info!("[{:5.1}s {:?}] fails={}", t % 60.0, p, fails);
-        Timer::after(Duration::from_secs(1)).await;
+        Timer::after(Duration::from_millis(50)).await;
+    }
+}
+
+/// Panel position the simulated tracker reports in `mode`.
+fn current(mode: Mode, t: f32, man_pan: f32, man_tilt: f32) -> (f32, f32) {
+    match mode {
+        Mode::Manual | Mode::Hold => (man_pan, man_tilt),
+        Mode::Park => (0.0, 90.0),
+        _ => {
+            let s = sample(t);
+            (s.pan.unwrap_or(0.0), s.tilt.unwrap_or(0.0))
+        }
     }
 }
